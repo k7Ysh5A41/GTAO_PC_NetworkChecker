@@ -5,16 +5,20 @@ import time
 import psutil
 import requests
 import sys
+import os
 from ping3 import ping
 from colorama import Fore, Style, init
 from collections import deque, defaultdict
 
 # === 配置 ===
-LOCAL_IP = "172.19.84.237"
+# 移除了固定的LOCAL_IP，改为用户输入
 SAMPLE_INTERVAL = 2
 UI_REFRESH_RATE = 10
 HISTORY_SIZE = 10
 GEO_CACHE_TTL = 3600  # 1小时缓存
+
+# 新增UDP监控端口（GTA在线模式专用）
+UDP_PORTS_TO_MONITOR = {6672, 61455, 61456, 61457, 61458}
 # ============
 
 init(autoreset=True)
@@ -31,10 +35,9 @@ ROCKSTAR_DOMAINS = {
     "prod.ros.rockstargames.com",
     "prod.telemetry.ros.rockstargames.com"
 }
-# 新增：Rockstar官方IP网段
+# 修改：仅保留52.139网段为官方中转，192.81显示为普通官方服务器
 ROCKSTAR_IP_RANGES = [
-    "52.139.",  # Rockstar官方服务器网段
-    "192.81.",  # Rockstar官方服务器网段
+    "52.139.",  # Rockstar官方中转服务器网段
 ]
 
 # 线程锁
@@ -42,11 +45,108 @@ data_lock = threading.Lock()
 geo_lock = threading.Lock()
 dns_lock = threading.Lock()
 
+# 存储UDP流量
 raw_bytes_map = defaultdict(int)
 geo_cache = {}
 dns_cache = {}  # 新增：DNS缓存
-gta_ports = set()
+gta_ports = set(UDP_PORTS_TO_MONITOR)  # 使用固定的UDP端口集合
 running = True
+LOCAL_IP = ""  # 将由用户输入
+
+
+def display_all_network_interfaces():
+    """显示所有网络接口的IP地址"""
+    print(f"\n{Fore.CYAN}=== 本地网络接口信息 ==={Style.RESET_ALL}")
+    print(f"{Fore.YELLOW}以下为您计算机上所有网络接口的IP地址:{Style.RESET_ALL}")
+    print(f"{Fore.YELLOW}请根据您的网络模式选择合适的IP:{Style.RESET_ALL}")
+
+    interfaces = []
+    try:
+        for name, addrs in psutil.net_if_addrs().items():
+            for addr in addrs:
+                if addr.family == socket.AF_INET and not addr.address.startswith("127."):
+                    interfaces.append((name, addr.address, addr.netmask))
+
+        if not interfaces:
+            print(f"{Fore.RED}未找到可用的网络接口！{Style.RESET_ALL}")
+            return
+
+        # 显示表格
+        print(f"{Fore.CYAN}{'=' * 60}{Style.RESET_ALL}")
+        print(f"{Style.BRIGHT}{'接口名称':<20} {'IP地址':<20} {'子网掩码':<15}{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}{'-' * 60}{Style.RESET_ALL}")
+
+        for name, ip, netmask in interfaces:
+            # 标记常见的接口类型
+            interface_type = ""
+            if "Virtual" in name or "VPN" in name or "TAP" in name or "Tunnel" in name:
+                interface_type = f"{Fore.GREEN}[虚拟网卡]{Style.RESET_ALL}"
+            elif "Wireless" in name or "Wi-Fi" in name or "WLAN" in name:
+                interface_type = f"{Fore.CYAN}[无线]{Style.RESET_ALL}"
+            elif "Ethernet" in name or "以太网" in name:
+                interface_type = f"{Fore.BLUE}[有线]{Style.RESET_ALL}"
+
+            print(f"{name:<20} {ip:<20} {netmask:<15} {interface_type}")
+
+        print(f"{Fore.CYAN}{'=' * 60}{Style.RESET_ALL}")
+
+        # 提供选择建议
+        print(f"\n{Fore.YELLOW}选择建议:{Style.RESET_ALL}")
+        print(f"  1. {Fore.GREEN}路由模式玩家:{Style.RESET_ALL} 选择显示为[虚拟网卡]的IP地址")
+        print(f"  2. {Fore.CYAN}进程模式玩家:{Style.RESET_ALL} 选择显示为[有线]或[无线]的IP地址")
+        print(f"  3. {Fore.YELLOW}不确定选哪个?{Style.RESET_ALL} 可以尝试先进入游戏战局，然后查看哪个IP有流量")
+
+    except Exception as e:
+        print(f"{Fore.RED}获取网络接口信息失败: {e}{Style.RESET_ALL}")
+
+
+def get_user_input_ip():
+    """获取用户输入的IP地址"""
+    # 先显示所有网络接口
+    display_all_network_interfaces()
+
+    print(f"\n{Fore.CYAN}=== IP地址输入 ==={Style.RESET_ALL}")
+    print(f"{Fore.YELLOW}路由模式玩家请输入虚拟网卡的IP{Style.RESET_ALL}")
+    print(f"{Fore.YELLOW}进程模式玩家请输入您的物理网卡的IP{Style.RESET_ALL}")
+    print(f"{Fore.YELLOW}提示: 可以按Ctrl+C退出程序{Style.RESET_ALL}")
+
+    while True:
+        try:
+            ip = input(
+                f"\n{Fore.GREEN}请输入要监控的本地IP地址 (直接回车使用第一个找到的IP): {Style.RESET_ALL}").strip()
+
+            # 如果直接回车，使用第一个可用的IP
+            if not ip:
+                interfaces = get_network_info()
+                if interfaces:
+                    ip = interfaces[0][1]
+                    print(f"{Fore.YELLOW}自动选择IP: {ip} (来自接口: {interfaces[0][0]}){Style.RESET_ALL}")
+                else:
+                    print(f"{Fore.RED}未找到可用网络接口，请手动输入IP{Style.RESET_ALL}")
+                    continue
+
+            # 基本IP格式验证
+            try:
+                socket.inet_aton(ip)
+
+                # 检查是否为本地/回环地址
+                if ip.startswith("127."):
+                    print(f"{Fore.RED}警告: 您输入的是回环地址(127.x.x.x)，这通常是错误的{Style.RESET_ALL}")
+                    confirm = input(f"{Fore.YELLOW}是否继续使用此IP? (y/n): {Style.RESET_ALL}").lower()
+                    if confirm != 'y':
+                        continue
+
+                # 显示确认信息
+                print(f"\n{Fore.GREEN}✓ 已设置监控IP: {ip}{Style.RESET_ALL}")
+                return ip
+
+            except socket.error:
+                print(f"{Fore.RED}无效的IP地址格式，请重新输入{Style.RESET_ALL}")
+                continue
+
+        except KeyboardInterrupt:
+            print(f"\n{Fore.YELLOW}用户取消输入，退出程序{Style.RESET_ALL}")
+            sys.exit(0)
 
 
 def get_str_width(s):
@@ -239,9 +339,9 @@ def get_rockstar_server_type(ip, domain, asn_info):
             if rockstar_domain in domain:
                 return "官方-CDN服务器与云服务器"
 
-    # 3. 检查Rockstar官方IP网段
+    # 3. 检查Rockstar官方IP网段 - 仅52.139网段显示为官方中转
     if is_rockstar_ip_range(ip):
-        return "官方-其他服务器"
+        return "官方-中转服务器"
 
     # 4. 检查Take-Two ASN信息
     if is_take_two_ip(asn_info):
@@ -412,7 +512,7 @@ peers_map = {}
 
 
 def sniffer():
-    """网络数据包嗅探"""
+    """网络数据包嗅探 - 仅UDP"""
     try:
         # 解析IP和端口
         if ":" in LOCAL_IP:
@@ -422,7 +522,7 @@ def sniffer():
             local_ip = LOCAL_IP
             local_port = 0
 
-        s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_IP)
+        s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_UDP)
         s.bind((local_ip, local_port))
         s.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
         if hasattr(socket, 'SIO_RCVALL') and psutil.WINDOWS:
@@ -442,7 +542,7 @@ def sniffer():
             ihl = (iph[0] & 0xF) * 4
             udph = struct.unpack('!HHHH', raw[ihl:ihl + 8])
 
-            # 检查是否为GTA5端口
+            # 检查是否为GTA5端口（使用固定端口集）
             src_port = udph[0]
             dst_port = udph[1]
             if not (src_port in gta_ports or dst_port in gta_ports):
@@ -516,7 +616,10 @@ def port_scanner():
                         connections = p.net_connections(kind='udp')
                         for conn in connections:
                             if conn.laddr:
-                                tmp.add(conn.laddr.port)
+                                port = conn.laddr.port
+                                # 只关注我们指定的UDP端口
+                                if port in UDP_PORTS_TO_MONITOR:
+                                    tmp.add(port)
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                     # 进程可能已经结束或无权访问
                     pass
@@ -524,16 +627,19 @@ def port_scanner():
             if running:
                 print(f"{Fore.RED}端口扫描错误: {e}{Style.RESET_ALL}")
 
-        if tmp != gta_ports:
-            gta_ports = tmp
+        # 合并固定的端口和动态发现的端口
+        all_ports = UDP_PORTS_TO_MONITOR.union(tmp)
+
+        if all_ports != gta_ports:
+            gta_ports = all_ports
             if gta_ports:
-                print(f"{Fore.CYAN}监控端口更新: {sorted(gta_ports)}{Style.RESET_ALL}")
+                print(f"{Fore.CYAN}监控UDP端口: {sorted(gta_ports)}{Style.RESET_ALL}")
 
         time.sleep(5)
 
 
 def get_network_info():
-    """获取网络接口信息"""
+    """获取网络接口信息（简化版）"""
     interfaces = []
     try:
         for name, addrs in psutil.net_if_addrs().items():
@@ -559,27 +665,38 @@ def cleanup():
 
 
 def main():
+    global LOCAL_IP
+
+    # 清屏开始
+    os.system('cls' if os.name == 'nt' else 'clear')
+
     print(f"{Fore.CYAN}=== GTA5 战局网络监控 (ASN精准识别版) ==={Style.RESET_ALL}")
-    print(f"{Fore.YELLOW}版本: 3.0 | 增加隐私保护 & 网段检测{Style.RESET_ALL}")
+    print(f"{Fore.YELLOW}版本: 3.4 | 优化显示 & 精简提示{Style.RESET_ALL}")
+
+    # 获取用户输入的IP
+    LOCAL_IP = get_user_input_ip()
+
+    # 清屏显示配置信息
+    os.system('cls' if os.name == 'nt' else 'clear')
+
+    print(f"{Fore.CYAN}=== GTA5 战局网络监控 (ASN精准识别版) ==={Style.RESET_ALL}")
+    print(f"{Fore.RED}⚠️  连接状况仅供参考，请根据实际情况自行判断{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}{'=' * 60}{Style.RESET_ALL}")
 
     # 显示官方服务器配置信息
     print(f"{Fore.GREEN}官方服务器配置:{Style.RESET_ALL}")
     print(f"  交易服务器: {', '.join(TRADE_SERVER_IPS)}")
     print(f"  云存档服务器: {', '.join(CLOUD_SAVE_SERVER_IPS)}")
     print(f"  Rockstar域名: {len(ROCKSTAR_DOMAINS)}个")
-    print(f"  Rockstar网段: {', '.join(ROCKSTAR_IP_RANGES)}")
+    print(f"  官方中转网段: 52.139.*.*")
 
-    # 显示网络接口信息
-    interfaces = get_network_info()
-    if interfaces:
-        print(f"{Fore.GREEN}可用网络接口:{Style.RESET_ALL}")
-        for name, ip in interfaces:
-            print(f"  {name}: {ip}")
-
-    print(f"{Fore.YELLOW}监控本地IP: {LOCAL_IP}{Style.RESET_ALL}")
+    print(f"\n{Fore.YELLOW}监控本地IP: {LOCAL_IP}{Style.RESET_ALL}")
     print(f"{Fore.YELLOW}采样间隔: {SAMPLE_INTERVAL}s | 刷新率: {UI_REFRESH_RATE}s{Style.RESET_ALL}")
     print(f"{Fore.YELLOW}目标进程: {TARGET_PROCESS_KEYWORDS}{Style.RESET_ALL}")
     print(f"{Fore.YELLOW}隐私保护: 国内玩家IP显示为 X.X.*.* 格式{Style.RESET_ALL}")
+    print(f"{Fore.YELLOW}UDP监控端口: {sorted(UDP_PORTS_TO_MONITOR)}{Style.RESET_ALL}")
+    print(f"{Fore.YELLOW}说明: GTA在线模式仅使用UDP连接{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}{'=' * 60}{Style.RESET_ALL}")
 
     # 检查管理员权限
     if psutil.WINDOWS:
@@ -588,6 +705,7 @@ def main():
             is_admin = ctypes.windll.shell32.IsUserAnAdmin()
             if not is_admin:
                 print(f"{Fore.RED}警告: 可能需要管理员权限运行以捕获原始套接字{Style.RESET_ALL}")
+                print(f"{Fore.YELLOW}如果监控不到流量，请尝试以管理员身份重新运行{Style.RESET_ALL}")
         except:
             pass
 
@@ -601,21 +719,40 @@ def main():
 
     print(f"{Fore.GREEN}监控已启动...{Style.RESET_ALL}")
     print(f"{Fore.YELLOW}按 Ctrl+C 停止监控{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}{'=' * 60}{Style.RESET_ALL}")
 
     try:
         last_refresh = time.time()
+        refresh_count = 0
+
         while True:
             current_time = time.time()
             time_to_wait = max(1, UI_REFRESH_RATE - (current_time - last_refresh))
 
-            # 显示倒计时
+            # 显示倒计时（在单行更新）
             for i in range(int(time_to_wait), 0, -1):
+                # 只更新倒计时行，不清除整个屏幕
                 sys.stdout.write(
-                    f"\r{Fore.YELLOW}⏱️ 刷新倒计时 {i}s | 活跃连接: {len(peers_map)} | 监控端口: {len(gta_ports)} | 按Ctrl+C退出...")
+                    f"\r{Fore.YELLOW}⏱️ 刷新倒计时 {i}s | 活跃连接: {len(peers_map)} | UDP端口: {len(gta_ports)} | 按Ctrl+C退出...")
                 sys.stdout.flush()
                 time.sleep(1)
 
             last_refresh = time.time()
+            refresh_count += 1
+
+            # 清屏并显示新内容
+            os.system('cls' if os.name == 'nt' else 'clear')
+
+            # 显示标题和警告
+            print(f"{Fore.CYAN}=== GTA5 战局网络监控 (ASN精准识别版) ==={Style.RESET_ALL}")
+            print(f"{Fore.RED}⚠️  连接状况仅供参考，请根据实际情况自行判断{Style.RESET_ALL}")
+            print(f"{Fore.CYAN}{'=' * 60}{Style.RESET_ALL}")
+
+            # 显示基本信息
+            print(f"{Fore.YELLOW}监控IP: {LOCAL_IP} | 刷新次数: {refresh_count}{Style.RESET_ALL}")
+            print(
+                f"{Fore.YELLOW}活跃连接数: {len(peers_map)} | UDP端口: {sorted(gta_ports) if gta_ports else '等待GTA5进程...'}{Style.RESET_ALL}")
+            print(f"{Fore.CYAN}{'=' * 130}{Style.RESET_ALL}")
 
             # 收集数据
             rows = []
@@ -629,29 +766,27 @@ def main():
             # 按平均速度降序排序
             rows.sort(key=lambda x: x['stats']['avg_speed'], reverse=True)
 
-            # 清屏并显示
-            print("\033[2J\033[H")
-            print(f"{Fore.CYAN}=== GTA5 战局网络监控 (ASN精准识别版) ==={Style.RESET_ALL}")
-            print(
-                f"{Fore.YELLOW}活跃连接数: {len(rows)} | 监控端口: {sorted(gta_ports) if gta_ports else '等待GTA5进程...'}{Style.RESET_ALL}")
-            print("-" * 140)  # 增加分隔线宽度以适应更宽显示
-
-            # 表头 - 增加各列宽度以容纳更多信息
+            # 表头 - 简化列（移除UPnP相关列）
             header = (
-                f"{pad_text('状态', 6)} | "  # 状态列加宽
-                f"{pad_text('IP地址', 18)} | "  # IP列加宽
-                f"{pad_text('地区', 30)} | "  # 地区列大幅加宽
-                f"{pad_text('均速', 12)} | "  # 均速列加宽
-                f"{pad_text('峰值', 12)} | "  # 峰值列加宽
-                f"{pad_text('延迟', 10)} | "  # 延迟列加宽
-                f"{pad_text('ASN/运营商', 45)}"  # ASN列加宽
+                f"{pad_text('状态', 6)} | "  # 状态列
+                f"{pad_text('IP地址', 18)} | "  # IP列
+                f"{pad_text('地区', 30)} | "  # 地区列
+                f"{pad_text('均速', 12)} | "  # 均速列
+                f"{pad_text('峰值', 12)} | "  # 峰值列
+                f"{pad_text('延迟', 12)} | "  # 延迟列
+                f"{pad_text('ASN/运营商', 35)}"  # ASN列
             )
             print(Style.BRIGHT + header + Style.RESET_ALL)
-            print("-" * 140)
+            print(f"{Fore.CYAN}{'-' * 130}{Style.RESET_ALL}")
 
             if not rows:
-                print(f"{Fore.YELLOW}暂无活跃连接，等待GTA5网络流量...{Style.RESET_ALL}")
+                print(f"\n{Fore.YELLOW}暂无活跃连接，等待GTA5网络流量...{Style.RESET_ALL}")
                 print(f"{Fore.YELLOW}请确保GTA5正在运行且已进入在线战局{Style.RESET_ALL}")
+                print(f"{Fore.YELLOW}如果长时间无连接，请检查:{Style.RESET_ALL}")
+                print(f"  1. GTA5是否已在在线战局中")
+                print(f"  2. 选择的IP地址是否正确")
+                print(f"  3. 是否以管理员/root权限运行")
+                print(f"  4. 防火墙是否允许网络访问")
             else:
                 for item in rows:
                     p = item['peer']
@@ -702,6 +837,8 @@ def main():
                             row_color = Fore.LIGHTMAGENTA_EX  # 亮紫色
                         elif "CDN" in p.server_type:
                             row_color = Fore.LIGHTCYAN_EX  # 亮青色
+                        elif "中转" in p.server_type:  # 中转服务器
+                            row_color = Fore.LIGHTRED_EX  # 亮红色
                         else:
                             row_color = Fore.LIGHTYELLOW_EX  # 亮黄色
 
@@ -723,8 +860,8 @@ def main():
                     col_loc = pad_text(location_display, 30)  # 使用包含提示的字符串
                     col_spd = pad_text(spd_str, 12, 'right')
                     col_max = pad_text(max_str, 12, 'right')
-                    col_lat = pad_text(lat_str, 10, 'right')
-                    col_isp = pad_text(p.isp, 45)
+                    col_lat = pad_text(lat_str, 12, 'right')
+                    col_isp = pad_text(p.isp, 35)
 
                     print(
                         f"{row_color}{col_status} | "
@@ -736,12 +873,14 @@ def main():
                         f"{Style.DIM}{col_isp}{Style.RESET_ALL}"
                     )
 
-            print("-" * 140)
+            print(f"\n{Fore.CYAN}{'=' * 130}{Style.RESET_ALL}")
             print(f"{Style.DIM}状态: 💀断线 ⚠️空闲 🚀活跃 📡正常 📶低速 | 速度单位: KB/s | 延迟单位: ms{Style.RESET_ALL}")
             print(
                 f"{Style.DIM}提示: [裸连]国内IP (IP隐私保护) | [官方-*]服务器类型 | [疑似卡逼]速度>100KB/s{Style.RESET_ALL}")
-            print(f"{Style.DIM}服务器: 紫色=交易 亮紫=云存档 亮青=CDN 亮黄=其他官方{Style.RESET_ALL}")
+            print(f"{Style.DIM}服务器: 紫色=交易 亮紫=云存档 亮青=CDN 亮红=中转 亮黄=其他官方{Style.RESET_ALL}")
             print(f"{Style.DIM}地理: 国内[省份城市] 国外[国家 地区] | ASN: AS号码(运营商简名){Style.RESET_ALL}")
+            print(f"{Fore.CYAN}{'=' * 60}{Style.RESET_ALL}")
+            print(f"{Fore.RED}⚠️  连接状况仅供参考，请根据实际情况自行判断{Style.RESET_ALL}")
 
     except KeyboardInterrupt:
         print(f"\n{Fore.YELLOW}\n收到停止信号，正在关闭监控...{Style.RESET_ALL}")
